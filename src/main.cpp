@@ -1091,13 +1091,24 @@ static void saveBMP(const char* path, int w, int h)
 }
 
 // ---------------- main ----------------
+#ifndef PERIODIC_VERSION
+#define PERIODIC_VERSION "dev"
+#endif
+#ifndef PERIODIC_GIT_HASH
+#define PERIODIC_GIT_HASH "nogit"
+#endif
+
 int main(int argc, char** argv)
 {
     std::string shotPath;
     bool bench = false;
     bool demoTooltip = false;
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--select") && i + 1 < argc) g_selected = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-v")) {
+            printf("Periodic v%s (%s)\n", PERIODIC_VERSION, PERIODIC_GIT_HASH);
+            return 0;
+        }
+        else if (!strcmp(argv[i], "--select") && i + 1 < argc) g_selected = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
         else if (!strcmp(argv[i], "--bench")) bench = true;
         else if (!strcmp(argv[i], "--debug")) g_debugMarkers = true;
@@ -1114,7 +1125,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "加载元素数据失败: %s\n", err.c_str());
         return 1;
     }
-    printf("已加载 %zu 个元素\n", g_db.elements.size());
+    printf("Periodic v%s (%s) · 已加载 %zu 个元素\n",
+           PERIODIC_VERSION, PERIODIC_GIT_HASH, g_db.elements.size());
 
     if (!glfwInit()) {
         fprintf(stderr, "glfwInit 失败\n");
