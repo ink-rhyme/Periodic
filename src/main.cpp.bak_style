@@ -1,0 +1,959 @@
+// 元素周期表 — C++ / OpenGL 3.3 / GLFW / FreeType
+// 数据由 assets/elements_cn.csv (+ elements_en.csv) 运行时加载
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+
+#include "ElementData.h"
+#include "TextRenderer.h"
+
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+// ---------------- 布局常量 ----------------
+static const int   COLS = 18, ROWS = 10;
+static const float CELL_W = 66, CELL_H = 60, GAP = 2;
+static const float PITCH_X = CELL_W + GAP, PITCH_Y = CELL_H + GAP;
+static const float TABLE_X = 28, TABLE_Y = 30;
+static const float TABLE_W = COLS * PITCH_X - GAP;
+static const float TABLE_H = ROWS * PITCH_Y - GAP;
+static const float PANEL_X = TABLE_X + TABLE_W + 28;
+static const float PANEL_W = 400;
+static const float WIN_W   = PANEL_X + PANEL_W + 28;
+static const float WIN_H   = 812;
+
+// 主题色 — 真实磨砂玻璃（不透明底 + 高不透明面板 + 噪点纹理）
+static const float BG_TOP[3]    = {0.10f, 0.125f, 0.185f};
+static const float BG_BOT[3]    = {0.055f, 0.070f, 0.115f};
+static const float PANEL_TOP[4] = {0.155f, 0.185f, 0.260f, 0.92f};
+static const float PANEL_BOT[4] = {0.110f, 0.135f, 0.195f, 0.90f};
+static const float SUBTLE[4]    = {0.58f, 0.63f, 0.72f, 1.0f};
+static const float TEXT_HI[4]   = {0.95f, 0.96f, 0.98f, 1.0f};
+
+// ---------------- 全局状态 ----------------
+static ElementDB g_db;
+static TextRenderer g_text;
+static int  g_grid[ROWS][COLS] = {{0}};   // >0 原子序数; -1 镧系占位; -2 锕系占位; 0 空
+static int  g_selected = 0;               // 0=未选; >0 元素; -1/-2 占位
+static bool g_selectedIsPlaceholder = false;
+// 单击瞬间记录的鼠标位置 —— 切换选中只读取它，绝不依赖鼠标经过/悬停位置
+static double g_clickX = -1, g_clickY = -1;
+static GLuint g_prog = 0, g_vao = 0, g_vbo = 0;
+static int  g_winW = (int)WIN_W, g_winH = (int)WIN_H;
+// 拖拽移动（无边框窗口）
+static bool   g_dragging = false;
+static double g_dragLastX = 0, g_dragLastY = 0;
+// 鼠标移动事件时刻的坐标 —— 单击回调读取它（而不是回调时"当前"的位置，避免错位）
+static double g_lastCursorX = -1, g_lastCursorY = -1;
+
+// 原子核Tooltip状态
+static float g_nucCx = 0, g_nucCy = 0, g_nucR = 30;
+static bool g_nucMouseDown = false;
+static double g_nucPressTime = 0;
+// 触发模式：0=悬停 1=长按
+static int g_nucTriggerMode = 0;
+static const double g_nucLongPressThresh = 0.5;
+
+// ---------------- 着色器 ----------------
+static const char* kQuadVS = R"(#version 330 core
+layout(location = 0) in vec2 pos;
+layout(location = 1) in vec4 color;
+uniform mat4 proj;
+out vec4 vColor;
+void main() { gl_Position = proj * vec4(pos, 0.0, 1.0); vColor = color; }
+)";
+static const char* kQuadFS = R"(#version 330 core
+in vec4 vColor;
+out vec4 fragColor;
+// 磨砂玻璃噪点（免 sin 的廉价哈希，软件渲染下也快）
+float hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+void main() {
+    float n = hash(gl_FragCoord.xy * 0.7) * 0.065 - 0.0325;
+    vec4 c = vColor;
+    c.rgb += n * min(c.a * 1.6, 1.0);
+    fragColor = c;
+}
+)";
+
+static void ortho(float w, float h, float m[16]) {
+    std::memset(m, 0, 16 * sizeof(float));
+    m[0] = 2.0f / w; m[5] = -2.0f / h; m[10] = -1.0f;
+    m[12] = -1.0f; m[13] = 1.0f; m[15] = 1.0f;
+}
+
+static GLuint mkShader(GLenum type, const char* src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024]; glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+        fprintf(stderr, "shader error: %s\n", log);
+    }
+    return s;
+}
+
+// ---------------- 绘制辅助（全部合并进批缓冲，每帧一次绘制） ----------------
+static GLint g_projLoc = -1;
+static std::vector<float> g_batch;   // pos(2) + rgba(4)，整帧所有四边形/多边形顶点
+
+static void ensureProj() {
+    if (g_projLoc < 0) g_projLoc = glGetUniformLocation(g_prog, "proj");
+    static int cachedW = 0, cachedH = 0;
+    static float m[16];
+    if (g_winW != cachedW || g_winH != cachedH) {
+        ortho((float)g_winW, (float)g_winH, m);
+        cachedW = g_winW; cachedH = g_winH;
+    }
+    glUniformMatrix4fv(g_projLoc, 1, GL_FALSE, m);
+}
+
+// 提交整帧几何批（一次上传 + 一次绘制）
+static void flushBatch() {
+    if (g_batch.empty()) return;
+    glUseProgram(g_prog);
+    ensureProj();
+    glBindVertexArray(g_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(g_batch.size() * sizeof(float)),
+                 g_batch.data(), GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(g_batch.size() / 6));
+    g_batch.clear();
+}
+
+static void drawQuad(float x, float y, float w, float h,
+                     float r, float g, float b, float a) {
+    float buf[36] = {
+        x,     y,     r, g, b, a,  x + w, y,     r, g, b, a,  x + w, y + h, r, g, b, a,
+        x,     y,     r, g, b, a,  x + w, y + h, r, g, b, a,  x,     y + h, r, g, b, a,
+    };
+    g_batch.insert(g_batch.end(), buf, buf + 36);
+}
+
+static void drawOutline(float x, float y, float w, float h, float t,
+                        float r, float g, float b, float a) {
+    drawQuad(x, y, w, t, r, g, b, a);
+    drawQuad(x, y + h - t, w, t, r, g, b, a);
+    drawQuad(x, y, t, h, r, g, b, a);
+    drawQuad(x + w - t, y, t, h, r, g, b, a);
+}
+
+// 渐变矩形：顶色到底色（模拟光照打在磨砂玻璃上）
+static void drawQuadGrad(float x, float y, float w, float h,
+                         float r1, float g1, float b1, float a1,
+                         float r2, float g2, float b2, float a2) {
+    float buf[36] = {
+        x,     y,     r1, g1, b1, a1,  x + w, y,     r1, g1, b1, a1,  x + w, y + h, r2, g2, b2, a2,
+        x,     y,     r1, g1, b1, a1,  x + w, y + h, r2, g2, b2, a2,  x,     y + h, r2, g2, b2, a2,
+    };
+    g_batch.insert(g_batch.end(), buf, buf + 36);
+}
+
+// ---------------- 圆形绘制 ----------------
+static void drawPoly(const float* verts, int nVerts) {
+    if (nVerts <= 0) return;
+    g_batch.insert(g_batch.end(), verts, verts + (size_t)nVerts * 6);
+}
+
+static void drawDisc(float cx, float cy, float rad,
+                     float r, float g, float b, float a, int segs = 28) {
+    std::vector<float> v;
+    v.reserve((size_t)segs * 18);
+    for (int i = 0; i < segs; ++i) {
+        float a0 = (float)i / segs * 6.28318530718f;
+        float a1 = (float)(i + 1) / segs * 6.28318530718f;
+        float x0 = cx + rad * cosf(a0), y0 = cy + rad * sinf(a0);
+        float x1 = cx + rad * cosf(a1), y1 = cy + rad * sinf(a1);
+        float t[18] = {cx, cy, r, g, b, a,  x0, y0, r, g, b, a,  x1, y1, r, g, b, a};
+        v.insert(v.end(), t, t + 18);
+    }
+    drawPoly(v.data(), (int)v.size() / 6);
+}
+
+static void drawRing(float cx, float cy, float rad, float thick,
+                     float r, float g, float b, float a, int segs = 64) {
+    float rI = rad - thick * 0.5f, rO = rad + thick * 0.5f;
+    std::vector<float> v;
+    v.reserve((size_t)segs * 36);
+    for (int i = 0; i < segs; ++i) {
+        float a0 = (float)i / segs * 6.28318530718f;
+        float a1 = (float)(i + 1) / segs * 6.28318530718f;
+        float c0 = cosf(a0), s0 = sinf(a0), c1 = cosf(a1), s1 = sinf(a1);
+        float q[36] = {
+            cx + rI*c0, cy + rI*s0, r,g,b,a,  cx + rO*c0, cy + rO*s0, r,g,b,a,  cx + rO*c1, cy + rO*s1, r,g,b,a,
+            cx + rI*c0, cy + rI*s0, r,g,b,a,  cx + rO*c1, cy + rO*s1, r,g,b,a,  cx + rI*c1, cy + rI*s1, r,g,b,a,
+        };
+        v.insert(v.end(), q, q + 36);
+    }
+    drawPoly(v.data(), (int)v.size() / 6);
+}
+
+// ---------------- 玻尔原子模型 ----------------
+static std::vector<int> parseShells(const std::string& s) {
+    std::vector<int> out;
+    int val = 0; bool in = false;
+    for (char ch : s) {
+        if (ch >= '0' && ch <= '9') { val = val * 10 + (ch - '0'); in = true; }
+        else if (in) { out.push_back(val); val = 0; in = false; }
+    }
+    if (in) out.push_back(val);
+    return out;
+}
+
+// 原子核：默认只绘制简化的1质子+1中子（用户要求）
+static void drawNucleus(float cx, float cy, float radius, int protons, int neutrons) {
+    // 记录当前原子核坐标和半径给tooltip使用
+    g_nucCx = cx;
+    g_nucCy = cy;
+    g_nucR = radius;
+
+    // 深色核壳背景
+    drawDisc(cx, cy, radius, 0.28f, 0.31f, 0.40f, 0.78f, 28);
+    drawRing(cx, cy, radius, 1.2f, 0.52f, 0.57f, 0.70f, 0.35f);
+
+    // 默认固定显示：1个质子(红) + 1个中子(灰)
+    float subR = radius * 0.42f;
+    // 质子（红色）
+    drawDisc(cx - subR*0.5f, cy, subR, 1.0f, 0.35f, 0.3f, 1.0f, 16);
+    // 中子（灰色）
+    drawDisc(cx + subR*0.5f, cy, subR, 0.55f, 0.55f, 0.58f, 1.0f, 16);
+}
+
+static void drawBohrModel(float cx, float cy, float maxR, const std::vector<int>& shells,
+                           int protons, int neutrons) {
+    if (shells.empty()) return;
+    int n = (int)shells.size();
+    if (n > 7) n = 7;
+
+    // 原子核大小与核子数相关
+    int totalNucleons = protons + neutrons;
+    float nucR = 10.0f + 2.6f * powf((float)totalNucleons, 0.3333f);
+    float gap  = 6.0f;
+    float inner = nucR + gap;
+    float spacing = (maxR - inner) / (float)n;
+    if (spacing < 8.0f) spacing = 8.0f;
+
+    // 轨道线（批量：一次 drawPoly）
+    {
+        int ringSegs = 48;
+        std::vector<float> v;
+        v.reserve((size_t)n * ringSegs * 36);
+        for (int i = 0; i < n; ++i) {
+            float rad = inner + spacing * (float)(i + 1);
+            float rI = rad - 0.5f, rO = rad + 0.5f;
+            for (int k = 0; k < ringSegs; ++k) {
+                float a0 = (float)k / ringSegs * 6.28318530718f;
+                float a1 = (float)(k + 1) / ringSegs * 6.28318530718f;
+                float c0 = cosf(a0), s0 = sinf(a0), c1 = cosf(a1), s1 = sinf(a1);
+                float q[36] = {
+                    cx+rI*c0, cy+rI*s0, 0.55f,0.63f,0.78f,0.30f, cx+rO*c0, cy+rO*s0, 0.55f,0.63f,0.78f,0.30f, cx+rO*c1, cy+rO*s1, 0.55f,0.63f,0.78f,0.30f,
+                    cx+rI*c0, cy+rI*s0, 0.55f,0.63f,0.78f,0.30f, cx+rO*c1, cy+rO*s1, 0.55f,0.63f,0.78f,0.30f, cx+rI*c1, cy+rI*s1, 0.55f,0.63f,0.78f,0.30f,
+                };
+                v.insert(v.end(), q, q + 36);
+            }
+        }
+        drawPoly(v.data(), (int)v.size() / 6);
+    }
+
+    // 电子（全批量：一次 drawPoly）
+    {
+        std::vector<float> v;
+        for (int i = 0; i < n; ++i) {
+            int ne = shells[i];
+            if (ne <= 0) continue;
+            float rad = inner + spacing * (float)(i + 1);
+            float eR  = ne <= 2 ? 5.5f : ne <= 8 ? 4.8f : ne <= 18 ? 4.0f : 3.2f;
+            int esegs = ne <= 8 ? 16 : ne <= 18 ? 12 : 10;
+            v.reserve(v.size() + (size_t)ne * esegs * 18);
+            for (int j = 0; j < ne; ++j) {
+                float ang = -1.5707963f + 6.28318530718f * (float)j / (float)ne;
+                float ex = cx + rad * cosf(ang);
+                float ey = cy + rad * sinf(ang);
+                for (int k = 0; k < esegs; ++k) {
+                    float a0 = (float)k / esegs * 6.28318530718f;
+                    float a1 = (float)(k + 1) / esegs * 6.28318530718f;
+                    float x0 = ex + eR * cosf(a0), y0 = ey + eR * sinf(a0);
+                    float x1 = ex + eR * cosf(a1), y1 = ey + eR * sinf(a1);
+                    float t[18] = {
+                        ex, ey, 0.90f, 0.72f, 0.30f, 1.0f,
+                        x0, y0, 0.82f, 0.62f, 0.22f, 1.0f,
+                        x1, y1, 0.82f, 0.62f, 0.22f, 1.0f,
+                    };
+                    v.insert(v.end(), t, t + 18);
+                }
+            }
+        }
+        if (!v.empty()) drawPoly(v.data(), (int)v.size() / 6);
+    }
+
+    // 原子核（默认只显示1质子+1中子）
+    drawNucleus(cx, cy, nucR, protons, neutrons);
+}
+
+// 绘制原子核Tooltip悬浮窗（半透明磨砂，带完整质子/中子排列示意图）
+static void drawNucleusTooltip(float mouseX, float mouseY) {
+    if (g_selected <= 0) return;
+    const Element* e = g_db.get(g_selected);
+    if (!e) return;
+
+    bool showTip = false;
+    float dx = mouseX - g_nucCx;
+    float dy = mouseY - g_nucCy;
+    bool inNuc = (dx*dx + dy*dy <= g_nucR*g_nucR);
+
+    if (g_nucTriggerMode == 0) {
+        showTip = inNuc;
+    } else {
+        if (g_nucMouseDown && inNuc) {
+            double hold = glfwGetTime() - g_nucPressTime;
+            showTip = (hold >= g_nucLongPressThresh);
+        } else {
+            showTip = false;
+        }
+    }
+
+    if (!showTip) return;
+
+    // 悬浮窗尺寸
+    float tipW = 240, tipH = 200;
+    float tipX = mouseX + 20;
+    float tipY = mouseY + 20;
+    if (tipX + tipW > g_winW) tipX = mouseX - tipW - 20;
+    if (tipY + tipH > g_winH) tipY = mouseY - tipH - 20;
+
+    // 半透明磨砂背景
+    drawQuadGrad(tipX, tipY, tipW, tipH,
+                 0.18f,0.20f,0.28f,0.55f,
+                 0.12f,0.14f,0.20f,0.50f);
+    drawQuad(tipX, tipY, tipW, 1, 1,1,1, 0.10f);
+    drawOutline(tipX, tipY, tipW, tipH, 1.0f, 0.9f,0.75f,0.3f, 0.8f);
+
+    // 标题
+    g_text.draw("原子核结构", tipX + 14, tipY + 12, 15, 1.0f,0.82f,0.3f,1.0f);
+
+    // 左侧：完整质子/中子排列示意图
+    float nucDrawCx = tipX + 55;
+    float nucDrawCy = tipY + 100;
+    float nucDrawR = 38;
+    // 深色核壳背景
+    drawDisc(nucDrawCx, nucDrawCy, nucDrawR, 0.28f, 0.31f, 0.40f, 0.78f, 28);
+    drawRing(nucDrawCx, nucDrawCy, nucDrawR, 1.0f, 0.52f, 0.57f, 0.70f, 0.35f);
+
+    int protons = e->number;
+    int neutrons = e->neutrons;
+    int total = protons + neutrons;
+    float subR = 4.0f;
+    float innerR = nucDrawR * 0.85f;
+    float golden = 2.39996f;
+
+    int pLeft = protons, nLeft = neutrons;
+    for (int i = 0; i < total; ++i) {
+        bool isP;
+        if (nLeft == 0) isP = true;
+        else if (pLeft == 0) isP = false;
+        else isP = ((i + 1) * protons + total - 1) / total != (i * protons + total - 1) / total;
+        if (isP) --pLeft; else --nLeft;
+
+        float frac = ((float)i + 0.5f) / total;
+        float r = innerR * sqrtf(frac);
+        float theta = (float)i * golden;
+        float nx = nucDrawCx + r * cosf(theta);
+        float ny = nucDrawCy + r * sinf(theta);
+        if (isP) {
+            drawDisc(nx, ny, subR, 1.0f,0.4f,0.35f,1.0f, 10);
+        } else {
+            drawDisc(nx, ny, subR, 0.6f,0.6f,0.65f,1.0f, 10);
+        }
+    }
+
+    // 右侧：文字信息
+    float textX = tipX + 110;
+    float textY = tipY + 55;
+    char buf[128];
+
+    // 质子
+    drawDisc(textX, textY, 5, 1.0f,0.4f,0.35f,1.0f, 10);
+    snprintf(buf, sizeof(buf), "质子：%d", protons);
+    g_text.draw(buf, textX + 12, textY - 4, 13, 1.0f,0.45f,0.4f,1.0f);
+    textY += 30;
+
+    // 中子
+    drawDisc(textX, textY, 5, 0.6f,0.6f,0.65f,1.0f, 10);
+    snprintf(buf, sizeof(buf), "中子：%d", neutrons);
+    g_text.draw(buf, textX + 12, textY - 4, 13, 0.75f,0.75f,0.78f,1.0f);
+    textY += 30;
+
+    // 总数
+    drawQuad(textX - 5, textY - 12, tipW - (textX - tipX) - 20, 1, 1,1,1,0.08f);
+    snprintf(buf, sizeof(buf), "核子总数：%d", total);
+    g_text.draw(buf, textX - 5, textY, 13, 0.95f,0.95f,0.95f,1.0f);
+}
+
+// ---------------- 命中测试 ----------------
+// 屏幕坐标 -> 帧缓冲坐标（HiDPI 缩放下两者比例可能不同）
+static void screenToFB(GLFWwindow* w, double sx, double sy, double& fx, double& fy) {
+    int ww = 1, wh = 1, fw = 1, fh = 1;
+    glfwGetWindowSize(w, &ww, &wh);
+    glfwGetFramebufferSize(w, &fw, &fh);
+    fx = (ww > 0) ? sx * (double)fw / (double)ww : sx;
+    fy = (wh > 0) ? sy * (double)fh / (double)wh : sy;
+}
+
+// 严格命中：点必须落在某个格子的矩形内（格缝/边缘不算命中）
+// 返回: 1=点中格子(row,col 有效); 0=表内但点在格缝(不切换); -1=表外
+static int cellAt(double mx, double my, int& row, int& col) {
+    double lx = mx - TABLE_X, ly = my - TABLE_Y;
+    double totalW = COLS * PITCH_X - GAP, totalH = ROWS * PITCH_Y - GAP;
+    if (lx < 0 || ly < 0 || lx > totalW || ly > totalH) return -1;
+    int c = (int)(lx / PITCH_X), r = (int)(ly / PITCH_Y);
+    if (c >= COLS) c = COLS - 1;
+    if (r >= ROWS) r = ROWS - 1;
+    if (lx - c * PITCH_X > CELL_W) return 0;   // 竖缝
+    if (ly - r * PITCH_Y > CELL_H) return 0;   // 横缝
+    row = r; col = c;
+    return 1;
+}
+
+// ---------------- 详情面板 ----------------
+static std::string fmtF(float v, int prec = 2) {
+    if (v == 0.0f) return "—";
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*f", prec, v);
+    return buf;
+}
+
+static std::string fmtYear(const Element& e) {
+    if (e.discoveryYear == 0) return "古代已知";
+    return std::to_string(e.discoveryYear) + " 年";
+}
+
+static void drawDetails(float x, float y, float w) {
+    // 面板背景：磨砂玻璃渐变
+    float ph = WIN_H - y - 24;
+    drawQuadGrad(x, y, w, ph,
+                 PANEL_TOP[0], PANEL_TOP[1], PANEL_TOP[2], PANEL_TOP[3],
+                 PANEL_BOT[0], PANEL_BOT[1], PANEL_BOT[2], PANEL_BOT[3]);
+    // 顶部高光线
+    drawQuad(x, y, w, 1, 1, 1, 1, 0.10f);
+    drawQuad(x, y, 1, ph, 1, 1, 1, 0.05f);
+
+    if (g_selected == 0) {
+        g_text.draw("元素详情", x + 24, y + 28, 20, TEXT_HI[0], TEXT_HI[1], TEXT_HI[2], 1.0f);
+        g_text.draw("点击左侧周期表中的元素查看详情", x + 24, y + 76, 14, SUBTLE[0], SUBTLE[1], SUBTLE[2], 1.0f);
+        g_text.draw("空白位置点击无反应", x + 24, y + 102, 14, SUBTLE[0], SUBTLE[1], SUBTLE[2], 1.0f);
+        g_text.draw("按 ESC 取消选择", x + 24, y + 128, 14, SUBTLE[0], SUBTLE[1], SUBTLE[2], 1.0f);
+        return;
+    }
+
+    if (g_selectedIsPlaceholder) {
+        g_text.draw("元素详情", x + 24, y + 28, 20, TEXT_HI[0], TEXT_HI[1], TEXT_HI[2], 1.0f);
+        const char* t1 = (g_selected == -1)
+            ? "镧系元素（57 ~ 71 号）" : "锕系元素（89 ~ 103 号）";
+        const char* t2 = (g_selected == -1)
+            ? "La 镧 ~ Lu 镥，共 15 种元素" : "Ac 锕 ~ Lr 铹，共 15 种元素";
+        g_text.draw(t1, x + 24, y + 80, 16, 0.80f, 0.46f, 0.69f, 1.0f);
+        g_text.draw(t2, x + 24, y + 110, 14, SUBTLE[0], SUBTLE[1], SUBTLE[2], 1.0f);
+        g_text.draw("位于周期表下方两排，点击可查看单个元素", x + 24, y + 136, 14, SUBTLE[0], SUBTLE[1], SUBTLE[2], 1.0f);
+        return;
+    }
+
+    const Element* e = g_db.get(g_selected);
+    if (!e) return;
+
+    // 类别色条
+    float rgb[3];
+    categoryColor(e->category, rgb);
+    drawQuad(x, y, w, 6, rgb[0], rgb[1], rgb[2], 1.0f);
+
+    // 标题
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "%s  %s", e->symbol.c_str(), e->nameCn.c_str());
+    g_text.draw(hdr, x + 24, y + 26, 30, TEXT_HI[0], TEXT_HI[1], TEXT_HI[2], 1.0f);
+    // 拼音 + 英文名
+    std::string sub = e->pinyin;
+    if (!e->nameEn.empty()) {
+        if (!sub.empty()) sub += "  ·  ";
+        sub += e->nameEn;
+    }
+    if (!sub.empty())
+        g_text.draw(sub, x + 24, y + 66, 14, SUBTLE[0], SUBTLE[1], SUBTLE[2], 0.9f);
+
+    // 类别徽章
+    float bw = 108, bh = 24;
+    drawQuad(x + 24, y + 92, bw, bh, rgb[0], rgb[1], rgb[2], 0.30f);
+    drawOutline(x + 24, y + 92, bw, bh, 1, rgb[0], rgb[1], rgb[2], 0.8f);
+    g_text.draw(categoryChinese(e->category), x + 34, y + 97, 13, rgb[0] * 1.1f, rgb[1] * 1.1f, rgb[2] * 1.1f, 1.0f);
+
+    // ---- 玻尔电子层模型（面板右侧）----
+    std::vector<int> shellList = parseShells(e->shells);
+    if (!shellList.empty()) {
+        float bcx = x + w - 118;
+        float bcy = y + 130;
+        float bR  = 96.0f;
+        // 小标题
+        g_text.drawCentered("电子层结构", bcx, y + 20, 11, 0.55f, 0.62f, 0.75f, 0.9f);
+        drawBohrModel(bcx, bcy, bR, shellList, e->number, e->neutrons);
+        // 每层电子数
+        g_text.drawCentered(e->shells.c_str(), bcx, y + 238, 11, 0.55f, 0.62f, 0.72f, 0.85f);
+    }
+
+    // 属性
+    struct Row { const char* k; std::string v; };
+    std::vector<Row> rows;
+    rows.push_back({"原子序数", std::to_string(e->number)});
+    rows.push_back({"质子 / 中子", std::to_string(e->number) + " / " + std::to_string(e->neutrons)});
+    rows.push_back({"元素符号", e->symbol});
+    rows.push_back({"原子量", e->mass});
+    rows.push_back({"周期 / 族", std::to_string(e->period) + " / " +
+                    (e->group ? std::to_string(e->group) : "f 区")});
+    rows.push_back({"区块", e->block.empty() ? "—" : e->block + " 区"});
+    if (!e->oxidationStates.empty())
+        rows.push_back({"氧化态", e->oxidationStates});
+    rows.push_back({"电负性", e->electronegativity ? fmtF(e->electronegativity) : "—"});
+    rows.push_back({"电离能", e->ionizationEnergy ? fmtF(e->ionizationEnergy, 1) + " kJ/mol" : "—"});
+    rows.push_back({"电子亲和能", e->electronAffinity ? fmtF(e->electronAffinity, 1) + " kJ/mol" : "—"});
+    rows.push_back({"原子半径", e->atomicRadius ? fmtF(e->atomicRadius, 0) + " pm" : "—"});
+    rows.push_back({"密度", e->density ? fmtF(e->density, 4) + " g/cm³" : "—"});
+    rows.push_back({"熔点", e->meltingK ? fmtF(e->meltingK, 1) + " K" : "—"});
+    rows.push_back({"沸点", e->boilingK ? fmtF(e->boilingK, 1) + " K" : "—"});
+    rows.push_back({"常温状态", phaseChinese(e->phase)});
+    rows.push_back({"放射性", e->radioactive ? "是" : "否"});
+    rows.push_back({"人造元素", e->synthetic ? "是" : "否"});
+    rows.push_back({"发现时间", fmtYear(*e)});
+    if (!e->discoveredBy.empty())
+        rows.push_back({"发现者", e->discoveredBy});
+
+    float ly = y + 262;
+    for (auto& r : rows) {
+        if (ly > WIN_H - 60) break;
+        g_text.draw(r.k, x + 24, ly, 13, 0.62f, 0.67f, 0.75f, 1.0f);
+        // 值过长则截断显示
+        std::string v = r.v;
+        float maxVw = w - 48 - 110;
+        while (g_text.width(v, 13) > maxVw && v.size() > 4)
+            v = v.substr(0, v.size() - 2);
+        if (v != r.v) v += "…";
+        g_text.draw(v, x + 138, ly, 13, TEXT_HI[0], TEXT_HI[1], TEXT_HI[2], 1.0f);
+        ly += 24;
+    }
+}
+
+// ---------------- 图例 ----------------
+static void drawLegend(float x, float y) {
+    static const ElemCategory cats[] = {
+        ElemCategory::AlkaliMetal, ElemCategory::AlkalineEarth,
+        ElemCategory::TransitionMetal, ElemCategory::PostTransition,
+        ElemCategory::Metalloid, ElemCategory::Nonmetal,
+        ElemCategory::Halogen, ElemCategory::NobleGas,
+        ElemCategory::Lanthanide, ElemCategory::Actinide,
+        ElemCategory::Unknown,
+    };
+    float cx = x;
+    for (ElemCategory c : cats) {
+        float rgb[3];
+        categoryColor(c, rgb);
+        drawQuadGrad(cx, y, 14, 14, rgb[0]*1.15f, rgb[1]*1.15f, rgb[2]*1.15f, 0.65f,
+                                    rgb[0]*0.85f, rgb[1]*0.85f, rgb[2]*0.85f, 0.58f);
+        drawOutline(cx, y, 14, 14, 1, rgb[0], rgb[1], rgb[2], 0.55f);
+        const char* label = categoryChinese(c);
+        g_text.draw(label, cx + 20, y - 1, 12, 0.78f, 0.82f, 0.90f, 1.0f);
+        cx += 20 + g_text.width(label, 12) + 22;
+    }
+}
+
+// ---------------- 单元格 ----------------
+static void drawCell(int r, int c) {
+    float x = TABLE_X + c * PITCH_X;
+    float y = TABLE_Y + r * PITCH_Y;
+    int z = g_grid[r][c];
+
+    if (z == 0) {
+        // 空位：暗色磨砂
+        drawQuadGrad(x, y, CELL_W, CELL_H, 0.115f, 0.140f, 0.195f, 0.65f,
+                                          0.095f, 0.115f, 0.165f, 0.60f);
+        drawOutline(x, y, CELL_W, CELL_H, 1, 0.16f, 0.19f, 0.26f, 0.40f);
+        return;
+    }
+
+    if (z < 0) {
+        // 占位格
+        drawQuadGrad(x, y, CELL_W, CELL_H, 0.22f, 0.26f, 0.35f, 0.75f,
+                                          0.17f, 0.20f, 0.28f, 0.70f);
+        drawOutline(x, y, CELL_W, CELL_H, 1, 0.35f, 0.40f, 0.52f, 0.55f);
+        bool sel = g_selectedIsPlaceholder && g_selected == z;
+        // 选中：醒目金色描边（只跟随点击，不跟随鼠标悬停）
+        if (sel) {
+            drawOutline(x - 1, y - 1, CELL_W + 2, CELL_H + 2, 3, 1.0f, 0.82f, 0.30f, 1.0f);
+            drawQuad(x + 1, y + 1, CELL_W - 2, CELL_H - 2, 1.0f, 0.85f, 0.35f, 0.12f);
+        }
+        const char* top = (z == -1) ? "57~71" : "89~103";
+        const char* bot = (z == -1) ? "镧系" : "锕系";
+        g_text.drawCentered(top, x + CELL_W / 2, y + CELL_H / 2 - 6, 13,
+                            0.88f, 0.91f, 0.97f, 1.0f);
+        g_text.drawCentered(bot, x + CELL_W / 2, y + CELL_H - 14, 12,
+                            0.68f, 0.74f, 0.85f, 1.0f);
+        return;
+    }
+
+    const Element* e = g_db.get(z);
+    if (!e) return;
+
+    float rgb[3];
+    categoryColor(e->category, rgb);
+    // 磨砂玻璃：顶亮底暗的渐变
+    drawQuadGrad(x, y, CELL_W, CELL_H,
+                 rgb[0]*1.18f + 0.03f, rgb[1]*1.18f + 0.03f, rgb[2]*1.18f + 0.03f, 0.62f,
+                 rgb[0]*0.82f,          rgb[1]*0.82f,          rgb[2]*0.82f,          0.55f);
+    // 顶部高光线（光从上面来）
+    drawQuad(x, y, CELL_W, 1, 1, 1, 1, 0.12f);
+    drawOutline(x, y, CELL_W, CELL_H, 1, rgb[0], rgb[1], rgb[2], 0.55f);
+
+    // 亮暗自适应文字（加亮保证可读）
+    float lum = 0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2];
+    float tr = lum > 0.55f ? 0.10f : 1.0f;
+    float tg = lum > 0.55f ? 0.12f : 1.0f;
+    float tb = lum > 0.55f ? 0.16f : 1.0f;
+
+    bool selected = (!g_selectedIsPlaceholder && g_selected == z);
+    // 选中：醒目金色描边 + 微光填充（只跟随点击，不跟随鼠标悬停）
+    if (selected) {
+        drawOutline(x - 1, y - 1, CELL_W + 2, CELL_H + 2, 3, 1.0f, 0.82f, 0.30f, 1.0f);
+        drawQuad(x + 1, y + 1, CELL_W - 2, CELL_H - 2, 1.0f, 0.85f, 0.35f, 0.12f);
+    }
+
+    // 原子序数 / 符号 / 拼音 / 中文名（文字加阴影底色保证清晰）
+    g_text.draw(std::to_string(e->number), x + 5, y + 2, 9, tr, tg, tb, 1.0f);
+    g_text.drawCentered(e->symbol, x + CELL_W / 2, y + 15, 19, tr, tg, tb, 1.0f);
+    if (!e->pinyin.empty())
+        g_text.drawCentered(e->pinyin, x + CELL_W / 2, y + 37, 8, tr, tg, tb, 0.85f);
+    g_text.drawCentered(e->nameCn, x + CELL_W / 2, y + CELL_H - 13, 11, tr, tg, tb, 1.0f);
+}
+
+// ---------------- 截图（调试用） ----------------
+static void saveBMP(const char* path, int w, int h) {
+    std::vector<unsigned char> buf((size_t)w * h * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, buf.data());
+    int rowRaw = w * 3;
+    int pad = (4 - rowRaw % 4) % 4;
+    int rowSize = rowRaw + pad;
+    int dataSize = rowSize * h;
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "无法写 %s\n", path); return; }
+    unsigned char hdr[54] = {0};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    int fileSize = 54 + dataSize;
+    memcpy(hdr + 2, &fileSize, 4);
+    int off = 54; memcpy(hdr + 10, &off, 4);
+    int ih = 40; memcpy(hdr + 14, &ih, 4);
+    memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4);
+    short planes = 1, bpp = 24;
+    memcpy(hdr + 26, &planes, 2); memcpy(hdr + 28, &bpp, 2);
+    memcpy(hdr + 34, &dataSize, 4);
+    fwrite(hdr, 1, 54, f);
+    std::vector<unsigned char> padrow((size_t)rowSize, 0);
+    for (int y = 0; y < h; ++y) {               // glReadPixels 自下而上 == BMP 行序
+        const unsigned char* src = buf.data() + (size_t)y * w * 3;
+        for (int x = 0; x < w; ++x) {            // RGB -> BGR
+            padrow[x * 3 + 0] = src[x * 3 + 2];
+            padrow[x * 3 + 1] = src[x * 3 + 1];
+            padrow[x * 3 + 2] = src[x * 3 + 0];
+        }
+        fwrite(padrow.data(), 1, rowSize, f);
+    }
+    fclose(f);
+    printf("已保存截图: %s (%dx%d)\n", path, w, h);
+}
+
+// ---------------- 回调 ----------------
+// 选中切换只依据「单击瞬间记录的位置」g_clickX/g_clickY：
+//   ① 按下时先把点击坐标记录进 g_clickX/g_clickY；
+//   ② 切换时直接读取该记录位置做命中判定，命中元素格才切换，空位/格缝/表外均不切换。
+// 全程不读鼠标经过/悬停位置 —— 点哪个就选哪个。
+static void handleLeftClick(double clickX, double clickY) {
+    int r, c;
+    if (cellAt(clickX, clickY, r, c) != 1) return;   // 表外或格缝：不切换
+    int z = g_grid[r][c];
+    if (z == 0) return;                              // 空位：无反应
+    // 直接读取记录的单击位置对应格子，切换选中目标
+    g_selected = z;
+    g_selectedIsPlaceholder = (z < 0);
+}
+
+static void onCursor(GLFWwindow* w, double x, double y) {
+    // 记录鼠标移动事件时刻的坐标（单击回调读取它，避免读到回调时已漂移的位置）
+    g_lastCursorX = x;
+    g_lastCursorY = y;
+    if (g_dragging) {
+        int wx, wy;
+        glfwGetWindowPos(w, &wx, &wy);
+        glfwSetWindowPos(w, wx + (int)(x - g_dragLastX), wy + (int)(y - g_dragLastY));
+        g_dragLastX = x; g_dragLastY = y;
+    }
+}
+
+static void onMouseButton(GLFWwindow* w, int button, int action, int) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
+    if (action == GLFW_PRESS) {
+        // 记录原子核tooltip按下状态
+        g_nucMouseDown = true;
+        g_nucPressTime = glfwGetTime();
+        // ① 记录单击瞬间位置（优先用移动事件记录的坐标；若尚无移动事件则现取一次）
+        double x = g_lastCursorX, y = g_lastCursorY;
+        if (x < 0 || y < 0) glfwGetCursorPos(w, &x, &y);
+        double fx, fy;
+        screenToFB(w, x, y, fx, fy);
+        g_clickX = fx;
+        g_clickY = fy;
+        // ② 切换：只读取上面记录的单击位置
+        int r, c;
+        int hit = cellAt(g_clickX, g_clickY, r, c);
+        if (hit == 1) {
+            handleLeftClick(g_clickX, g_clickY);     // 命中格子：切换（空位则无反应）
+        } else if (hit == -1) {
+            // 表外：拖拽移动无边框窗口
+            g_dragging = true;
+            g_dragLastX = x; g_dragLastY = y;
+        }
+        // hit == 0（表内格缝）：不切换也不拖拽
+    } else {
+        g_dragging = false;
+        g_nucMouseDown = false;
+    }
+}
+
+static void onKey(GLFWwindow* w, int key, int, int action, int) {
+    if (action != GLFW_PRESS) return;
+    if (key == GLFW_KEY_ESCAPE) {
+        g_selected = 0;
+        g_selectedIsPlaceholder = false;
+    }
+    if (key == GLFW_KEY_TAB) {
+        // Tab键切换触发模式：悬停/长按
+        g_nucTriggerMode = !g_nucTriggerMode;
+        printf("切换Tooltip触发模式：%s\n", g_nucTriggerMode == 0 ? "鼠标悬停" : "长按左键");
+    }
+    if (key == GLFW_KEY_Q && (glfwGetKey(w, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                              glfwGetKey(w, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS))
+        glfwSetWindowShouldClose(w, GLFW_TRUE);
+}
+
+// ---------------- 主循环帧 ----------------
+static void renderFrame() {
+    g_text.beginFrame(g_winW, g_winH);   // 文本批量：本帧入队
+    glClearColor(BG_BOT[0], BG_BOT[1], BG_BOT[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // 磨砂玻璃渐变背景（顶亮底暗）
+    drawQuadGrad(0, 0, (float)g_winW, (float)g_winH,
+                 BG_TOP[0], BG_TOP[1], BG_TOP[2], 1.0f,
+                 BG_BOT[0], BG_BOT[1], BG_BOT[2], 1.0f);
+
+    // 单元格
+    for (int r = 0; r < ROWS; ++r)
+        for (int c = 0; c < COLS; ++c)
+            drawCell(r, c);
+
+    // 图例
+    drawLegend(TABLE_X, TABLE_Y + TABLE_H + 22);
+
+    // 详情面板
+    drawDetails(PANEL_X, 24, PANEL_W);
+
+    // 原子核Tooltip（跟随鼠标）
+    drawNucleusTooltip((float)g_lastCursorX, (float)g_lastCursorY);
+
+    // 底部提示
+    g_text.draw("拖拽移动  ·  ESC 取消选择  ·  Tab切换触发模式  ·  Ctrl+Q 退出",
+                TABLE_X, WIN_H - 26, 11, 0.45f, 0.50f, 0.58f, 1.0f);
+
+    flushBatch();     // 整帧几何一次绘制
+    g_text.flush();   // 整帧文本一次绘制
+}
+
+// ---------------- 建表 ----------------
+static void buildGrid() {
+    int lanIdx = 0, actIdx = 0;
+    for (const auto& e : g_db.elements) {
+        if (e.category == ElemCategory::Lanthanide) {
+            if (lanIdx < 15) g_grid[8][2 + lanIdx++] = e.number;
+        } else if (e.category == ElemCategory::Actinide) {
+            if (actIdx < 15) g_grid[9][2 + actIdx++] = e.number;
+        } else if (e.group >= 1 && e.group <= 18 && e.period >= 1 && e.period <= 7) {
+            g_grid[e.period - 1][e.group - 1] = e.number;
+        }
+    }
+    g_grid[5][2] = -1;   // 镧系占位
+    g_grid[6][2] = -2;   // 锕系占位
+}
+
+// ---------------- main ----------------
+int main(int argc, char** argv) {
+    std::string dataDir = "assets";
+    std::string shotPath;
+    int presetSelect = 0;
+    double clickX = -1, clickY = -1;
+    bool bench = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--data" && i + 1 < argc) dataDir = argv[++i];
+        else if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
+        else if (a == "--select" && i + 1 < argc) presetSelect = atoi(argv[++i]);
+        else if (a == "--bench") bench = true;
+        else if (a == "--click" && i + 2 < argc) {
+            clickX = atof(argv[++i]);
+            clickY = atof(argv[++i]);
+        }
+    }
+
+    std::string err;
+    if (!g_db.load(dataDir + "/elements_cn.csv", dataDir + "/elements_en.csv", err)) {
+        fprintf(stderr, "加载元素数据失败: %s\n", err.c_str());
+        fprintf(stderr, "用法: %s [--data 目录] [--shot out.bmp] [--select 原子序数] [--click x y] [--bench]\n", argv[0]);
+        return 1;
+    }
+    printf("已加载 %zu 个元素\n", g_db.elements.size());
+    buildGrid();
+
+    if (presetSelect > 0) {
+        g_selected = presetSelect;
+        g_selectedIsPlaceholder = false;
+    }
+    if (clickX >= 0) handleLeftClick(clickX, clickY);   // 调试：模拟点击
+
+    if (!glfwInit()) {
+        fprintf(stderr, "glfwInit 失败\n");
+        return 1;
+    }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);             // 无边框
+    if (!shotPath.empty() || bench) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+
+    GLFWwindow* win = glfwCreateWindow(g_winW, g_winH, "元素周期表 — C++ / OpenGL", nullptr, nullptr);
+    if (!win) {
+        fprintf(stderr, "创建窗口失败（需要 OpenGL 3.3 / WSLg）\n");
+        glfwTerminate();
+        return 1;
+    }
+    glfwMakeContextCurrent(win);
+    glfwSwapInterval(1);
+
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK) {
+        fprintf(stderr, "glewInit 失败\n");
+        return 1;
+    }
+
+    std::string font = TextRenderer::findDefaultFont();
+    if (font.empty()) {
+        fprintf(stderr, "找不到中文字体，请安装: sudo apt install fonts-wqy-zenhei\n");
+        return 1;
+    }
+    printf("使用字体: %s\n", font.c_str());
+    if (!g_text.init(font)) return 1;
+
+    // quad VAO: pos(2) + rgba(4)
+    GLuint vs = mkShader(GL_VERTEX_SHADER, kQuadVS);
+    GLuint fs = mkShader(GL_FRAGMENT_SHADER, kQuadFS);
+    g_prog = glCreateProgram();
+    glAttachShader(g_prog, vs);
+    glAttachShader(g_prog, fs);
+    glLinkProgram(g_prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    glGenVertexArrays(1, &g_vao);
+    glGenBuffers(1, &g_vbo);
+    glBindVertexArray(g_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 6 * 16384, nullptr, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+    glBindVertexArray(0);
+
+    glfwSetCursorPosCallback(win, onCursor);
+    glfwSetMouseButtonCallback(win, onMouseButton);
+    glfwSetKeyCallback(win, onKey);
+
+    if (bench) {
+        // 切换性能基准：每帧切换一个元素，测平均帧耗时
+        // 不走 swap（隐藏窗口下 swap 可能阻塞），用 glFinish 同步
+        glfwSwapInterval(0);
+        glfwGetFramebufferSize(win, &g_winW, &g_winH);
+        glViewport(0, 0, g_winW, g_winH);
+        const int N = 150;
+        const char* bp = "/tmp/bench_result.txt";
+        FILE* bf = fopen(bp, "w");
+        if (bf) { fprintf(bf, "start %d frames\n", N); fflush(bf); }
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < N; ++i) {
+            g_selected = 1 + (i % 118);
+            g_selectedIsPlaceholder = false;
+            renderFrame();
+            if (bf && (i + 1) % 30 == 0) {
+                double el = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                fprintf(bf, "progress %d/%d, %.1f ms elapsed\n", i + 1, N, el);
+                fflush(bf);
+            }
+        }
+        glFinish();
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / N;
+        if (bf) {
+            fprintf(bf, "result: %d frames, %.3f ms/frame (%.0f FPS)\n", N, ms, 1000.0 / ms);
+            fclose(bf);
+        }
+        printf("[bench] 切换渲染 %d 帧, 平均 %.3f ms/帧 (%.0f FPS)\n", N, ms, 1000.0 / ms);
+        fflush(stdout);
+        g_text.shutdown();
+        glfwDestroyWindow(win);
+        glfwTerminate();
+        return 0;
+    }
+
+    if (!shotPath.empty()) {
+        // 截图模式：渲染两帧后导出
+        glfwGetFramebufferSize(win, &g_winW, &g_winH);
+        glViewport(0, 0, g_winW, g_winH);
+        renderFrame();
+        glfwSwapBuffers(win);
+        renderFrame();
+        saveBMP(shotPath.c_str(), g_winW, g_winH);
+        g_text.shutdown();
+        glfwDestroyWindow(win);
+        glfwTerminate();
+        return 0;
+    }
+
+    while (!glfwWindowShouldClose(win)) {
+        glfwGetFramebufferSize(win, &g_winW, &g_winH);
+        glViewport(0, 0, g_winW, g_winH);
+        renderFrame();
+        glfwSwapBuffers(win);
+        glfwPollEvents();
+    }
+
+    g_text.shutdown();
+    glDeleteBuffers(1, &g_vbo);
+    glDeleteVertexArrays(1, &g_vao);
+    glDeleteProgram(g_prog);
+    glfwDestroyWindow(win);
+    glfwTerminate();
+    return 0;
+}

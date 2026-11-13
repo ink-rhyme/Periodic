@@ -1,0 +1,7 @@
+# 构建产物
+build/
+bin/
+*.o
+*.d
+*.bmp
+.DS_Store
