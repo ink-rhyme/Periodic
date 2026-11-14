@@ -1,8 +1,11 @@
 ﻿# 从 WSL 侧调用，调整 WSLg 窗口在 Windows 上的呈现
-# 用法: powershell -File winframe.ps1 decor|full|restore
+# 用法: powershell -File winframe.ps1 decor|full|restore|watch
+#   decor   : 去圆角/阴影，并持续 2 秒，防止 Weston 立刻回写样式
+#   full    : 钉到主屏整屏矩形（含任务栏），同时起守护循环持续纠正
+#   restore : 按记录的原矩形还原，停止守护
+#   watch   : 内部用，循环纠正窗口
 param([string]$Mode = "decor")
 
-Add-Type -AssemblyName System.Windows.Forms
 Add-Type @"
 using System;
 using System.Text;
@@ -13,6 +16,7 @@ public class PWin {
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc f, IntPtr l);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
@@ -21,78 +25,171 @@ public class PWin {
     [DllImport("user32.dll", SetLastError = true)] public static extern int GetWindowLong(IntPtr h, int idx);
     [DllImport("user32.dll", SetLastError = true)] public static extern int SetWindowLong(IntPtr h, int idx, int val);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
-    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int val, int size);
 
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public int dwFlags; }
 
-    public static IntPtr Find(string key) {
-        IntPtr best = IntPtr.Zero; long area = -1;
+    // WSLg 应用窗口的类名是 RAIL_WINDOW；终端窗口类名是 CASCADIA_HOSTING_WINDOW_CLASS，
+    // 它的标题里同样带 "Periodic"，只按标题找会误伤终端，所以先按类名筛
+    public static IntPtr Find(string titleKey) {
+        IntPtr rail = IntPtr.Zero, railTitled = IntPtr.Zero, anyTitled = IntPtr.Zero;
+        long railArea = -1, railTitledArea = -1, anyTitledArea = -1;
         EnumWindows((h, l) => {
+            if (!IsWindowVisible(h)) return true;
+            RECT r; GetWindowRect(h, out r);
+            long a = (long)(r.Right - r.Left) * (r.Bottom - r.Top);
             var sb = new StringBuilder(512); GetWindowText(h, sb, 512);
-            if (sb.ToString().Contains(key) && IsWindowVisible(h)) {
-                RECT r; GetWindowRect(h, out r);
-                long a = (long)(r.Right - r.Left) * (r.Bottom - r.Top);
-                if (a > area) { area = a; best = h; }
+            var cn = new StringBuilder(256); GetClassName(h, cn, 256);
+            bool titleOk = sb.ToString().Contains(titleKey);
+            if (cn.ToString() == "RAIL_WINDOW") {
+                if (a > railArea) { railArea = a; rail = h; }
+                if (titleOk && a > railTitledArea) { railTitledArea = a; railTitled = h; }
             }
+            if (titleOk && a > anyTitledArea) { anyTitledArea = a; anyTitled = h; }
             return true;
         }, IntPtr.Zero);
-        return best;
+        if (railTitled != IntPtr.Zero) return railTitled;
+        if (rail != IntPtr.Zero) return rail;
+        return anyTitled;
     }
 
-    public static RECT ScreenRect() {
+    public static int[] ScreenRect() {
         MONITORINFO mi = new MONITORINFO(); mi.cbSize = Marshal.SizeOf(mi);
         IntPtr mon = MonitorFromPoint(new POINT { X = 0, Y = 0 }, 1);
         GetMonitorInfo(mon, ref mi);
-        return mi.rcMonitor;
+        return new int[] { mi.rcMonitor.Left, mi.rcMonitor.Top,
+                           mi.rcMonitor.Right - mi.rcMonitor.Left,
+                           mi.rcMonitor.Bottom - mi.rcMonitor.Top };
     }
 
-    // 去掉窗口的系统阴影：DWM 对带 WS_THICKFRAME/WS_CAPTION 的窗口会画阴影/圆角，
-    // 把窗口样式改成无框 POPUP 并让 DWM 重新计算框架，再关掉非客户区渲染
-    public static string StripFrame(IntPtr h) {
+    // Windows 对带 WS_THICKFRAME / WS_CAPTION 的窗口会画投影，改成无框 POPUP 才彻底没有
+    public static void StripFrame(IntPtr h) {
         const int GWL_STYLE = -16;
         int style = GetWindowLong(h, GWL_STYLE);
-        int mask = unchecked((int)0xFF3CF7FF);   // 清掉 CAPTION/THICKFRAME/SYSMENU/BORDER/DLGFRAME/MIN/MAX
-        style &= mask;
-        style = (int)((uint)style | 0x80000000u);  // WS_POPUP
-        SetWindowLong(h, GWL_STYLE, style);
-        const uint SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004;
-        SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
-
+        int mask = unchecked((int)0xFF3CF7FF);
+        int want = (int)((uint)(style & mask) | 0x80000000u);   // 去掉标题栏/粗细框，补 WS_POPUP
+        if (style != want) {
+            SetWindowLong(h, GWL_STYLE, want);
+            const uint SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004;
+            SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+        }
         int noRound = 1;   // DWMWCP_DONOTROUND
         DwmSetWindowAttribute(h, 33, ref noRound, 4);
         int noNc = 1;      // DWMNCRP_DISABLED
         DwmSetWindowAttribute(h, 2, ref noNc, 4);
-        int noShadow = 1;  // DWMWA_NCRENDERING_POLICY 之外的补充：关掉扩展框架
-        DwmSetWindowAttribute(h, 3, ref noShadow, 4);
-        return "style=0x" + style.ToString("X8");
     }
 
-    public static string RectText(IntPtr h) { RECT r; GetWindowRect(h, out r); return "" + r.Left + "," + r.Top + " " + (r.Right - r.Left) + "x" + (r.Bottom - r.Top); }
+    public static int[] Rect(IntPtr h) {
+        RECT r; GetWindowRect(h, out r);
+        return new int[] { r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top };
+    }
 
-    public static string Apply(string mode, string stateFile) {
-        IntPtr h = Find("Periodic");
-        if (h == IntPtr.Zero) return "no-window";
-        string st = StripFrame(h);
-        const uint SWP_SHOW = 0x0040;
-        if (mode == "full") {
-            RECT r; GetWindowRect(h, out r);
-            System.IO.File.WriteAllText(stateFile, r.Left + " " + r.Top + " " + (r.Right - r.Left) + " " + (r.Bottom - r.Top));
-            RECT s = ScreenRect();
-            SetWindowPos(h, new IntPtr(-1), s.Left, s.Top, s.Right - s.Left, s.Bottom - s.Top, SWP_SHOW);
-        } else if (mode == "restore") {
-            string txt = System.IO.File.Exists(stateFile) ? System.IO.File.ReadAllText(stateFile) : "";
-            string[] p = txt.Split(' ');
-            if (p.Length == 4) {
-                SetWindowPos(h, new IntPtr(-2), int.Parse(p[0]), int.Parse(p[1]), int.Parse(p[2]), int.Parse(p[3]), SWP_SHOW);
-            }
-        }
-        int corner = -1; DwmGetWindowAttribute(h, 33, out corner, 4);
-        return st + " rect=" + RectText(h) + " corner=" + corner;
+    public static bool AtRect(IntPtr h, int x, int y, int w, int hh) {
+        RECT r; GetWindowRect(h, out r);
+        return r.Left == x && r.Top == y && (r.Right - r.Left) == w && (r.Bottom - r.Top) == hh;
+    }
+
+    public static void Pin(IntPtr h, int x, int y, int w, int hh) {
+        const uint SWP_SHOW = 0x0040, SWP_NOACTIVATE = 0x0010;
+        SetWindowPos(h, new IntPtr(-1), x, y, w, hh, SWP_SHOW | SWP_NOACTIVATE);   // HWND_TOPMOST
+    }
+
+    public static string RectText(IntPtr h) {
+        int[] r = Rect(h);
+        return "" + r[0] + "," + r[1] + " " + r[2] + "x" + r[3];
     }
 }
 "@
 
 $stateFile = Join-Path $env:TEMP "periodic_frame.txt"
-[PWin]::Apply($Mode, $stateFile) | Write-Output
+$lockFile = Join-Path $env:TEMP "periodic_fullscreen.lock"
+$titleKey = "周期表"
+$self = $PSCommandPath
+
+# 把主屏尺寸（DIP）写到 WSL 的 /tmp，供应用把 GL 画布切成同样大小
+$parts = $PSCommandPath.Split('\')
+if ($parts.Length -gt 3) {
+    $wslRoot = '\\wsl$\' + $parts[3]
+    $screenTxt = Join-Path $wslRoot 'tmp\periodic_screen.txt'
+    $sr = [PWin]::ScreenRect()
+    try { Set-Content -LiteralPath $screenTxt -Value ("{0} {1}" -f $sr[2], $sr[3]) -Encoding ascii -ErrorAction Stop } catch { }
+}
+
+function Read-Lock {
+    if (Test-Path -LiteralPath $lockFile) { return (Get-Content -LiteralPath $lockFile -Raw).Trim() }
+    return ""
+}
+
+# 反复纠正：Weston 会在我们钉屏之后再把几何写回自己的尺寸
+function Watch-Loop([int]$seconds) {
+    $t = Read-Lock
+    if (-not $t) { return }
+    $p = $t.Split(' ')
+    if ($p.Length -ne 4) { return }
+    $tx = [int]$p[0]; $ty = [int]$p[1]; $tw = [int]$p[2]; $th = [int]$p[3]
+    $end = (Get-Date).AddSeconds($seconds)
+    while ((Get-Date) -lt $end) {
+        if (-not (Test-Path -LiteralPath $lockFile)) { return }
+        $h = [PWin]::Find($titleKey)
+        if ($h -eq [IntPtr]::Zero) { return }
+        [PWin]::StripFrame($h)
+        if (-not [PWin]::AtRect($h, $tx, $ty, $tw, $th)) { [PWin]::Pin($h, $tx, $ty, $tw, $th) }
+        Start-Sleep -Milliseconds 120
+    }
+}
+
+switch ($Mode) {
+    "full" {
+        $h = [PWin]::Find($titleKey)
+        if ($h -eq [IntPtr]::Zero) { "no-window"; break }
+        $cur = [PWin]::Rect($h)
+        Set-Content -LiteralPath $stateFile -Value ("{0} {1} {2} {3}" -f $cur[0], $cur[1], $cur[2], $cur[3]) -Encoding ascii
+        $sr = [PWin]::ScreenRect()
+        Set-Content -LiteralPath $lockFile -Value ("{0} {1} {2} {3}" -f $sr[0], $sr[1], $sr[2], $sr[3]) -Encoding ascii
+        [PWin]::StripFrame($h)
+        [PWin]::Pin($h, $sr[0], $sr[1], $sr[2], $sr[3])
+        Watch-Loop 900
+        "rect=" + [PWin]::RectText($h) + " target=" + ($sr -join " ")
+    }
+    "restore" {
+        if (Test-Path -LiteralPath $lockFile) { Remove-Item -LiteralPath $lockFile -Force }
+        $h = [PWin]::Find($titleKey)
+        if ($h -eq [IntPtr]::Zero) { "no-window"; break }
+        $txt = ""
+        if (Test-Path -LiteralPath $stateFile) { $txt = (Get-Content -LiteralPath $stateFile -Raw).Trim() }
+        $p = $txt.Split(' ')
+        if ($p.Length -eq 4) {
+            [PWin]::StripFrame($h)
+            [PWin]::SetWindowPos($h, [IntPtr]-2, [int]$p[0], [int]$p[1], [int]$p[2], [int]$p[3], 0x0040) | Out-Null
+        }
+        "rect=" + [PWin]::RectText($h)
+    }
+    "decor" {
+        $h = [PWin]::Find($titleKey)
+        if ($h -eq [IntPtr]::Zero) { "no-window"; break }
+        $end = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $end) {
+            $h = [PWin]::Find($titleKey)
+            if ($h -eq [IntPtr]::Zero) { break }
+            [PWin]::StripFrame($h)
+            Start-Sleep -Milliseconds 120
+        }
+        "rect=" + [PWin]::RectText($h)
+    }
+    "watch" {
+        $t = Read-Lock
+        if (-not $t) { break }
+        $p = $t.Split(' ')
+        if ($p.Length -ne 4) { break }
+        $tx = [int]$p[0]; $ty = [int]$p[1]; $tw = [int]$p[2]; $th = [int]$p[3]
+        while (Test-Path -LiteralPath $lockFile) {
+            $h = [PWin]::Find($titleKey)
+            if ($h -eq [IntPtr]::Zero) { break }
+            [PWin]::StripFrame($h)
+            if (-not [PWin]::AtRect($h, $tx, $ty, $tw, $th)) { [PWin]::Pin($h, $tx, $ty, $tw, $th) }
+            Start-Sleep -Milliseconds 120
+        }
+        if (Test-Path -LiteralPath $lockFile) { Remove-Item -LiteralPath $lockFile -Force -ErrorAction SilentlyContinue }
+    }
+}

@@ -972,6 +972,7 @@ static void onCursorPos(GLFWwindow* win, double x, double y)
 
 
 // 通过 WSL interop 调用 Windows 端脚本，把 WSLg 窗口钉成整屏 / 还原 / 去圆角阴影
+static double g_dbgsec = 0;
 static void winInterop(const char* mode)
 {
     const char* distro = getenv("WSL_DISTRO_NAME");
@@ -991,7 +992,8 @@ static void winInterop(const char* mode)
         " -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File '"
         + winPath + "' " + mode + " >/dev/null 2>&1 &";
     int rc = system(cmd.c_str());
-    (void)rc;
+    FILE* lf = fopen("/tmp/periodic_frame.log", "a");
+    if (lf) { fprintf(lf, "mode=%s rc=%d cmd=%s\n", mode, rc, cmd.c_str()); fclose(lf); }
 }
 
 static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
@@ -1016,7 +1018,14 @@ static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
                     // 画布先切成 16:9 并铺满，再让 Windows 端把窗口钉到主屏整屏矩形
                     // （含任务栏）；比例一致，钉屏后只是等比放大，不会变形
                     glfwSetWindowAspectRatio(win, GLFW_DONT_CARE, GLFW_DONT_CARE);
-                    glfwSetWindowSize(win, 1920, 1080);
+                    int sw = 1920, sh = 1080;   // 从 winframe.ps1 写下的屏幕尺寸读（DIP）
+                    FILE* sf = fopen("/tmp/periodic_screen.txt", "r");
+                    if (sf) {
+                        int a = 0, b = 0;
+                        if (fscanf(sf, "%d %d", &a, &b) == 2 && a > 0 && b > 0) { sw = a; sh = b; }
+                        fclose(sf);
+                    }
+                    glfwSetWindowSize(win, sw, sh);
                     glfwPollEvents();
                     winInterop("full");
                     maxed = true;
