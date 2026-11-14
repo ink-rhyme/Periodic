@@ -948,11 +948,16 @@ static void onCursorPos(GLFWwindow* win, double x, double y)
 {
     int ww = 0, wh = 0;
     glfwGetWindowSize(win, &ww, &wh);
-    float sx = (ww > 0) ? WIN_W / (float)ww : 1.0f;
-    float sy = (wh > 0) ? WIN_H / (float)wh : 1.0f;
+    // 与主循环的等比视口保持一致：按最小缩放铺满并居中，含黑边偏移
+    float sc = 1.0f;
+    if (ww > 0 && wh > 0)
+        sc = std::min((float)ww / WIN_W, (float)wh / WIN_H);
+    if (sc <= 0.0f) sc = 1.0f;
+    float offX = (ww - WIN_W * sc) * 0.5f;
+    float offY = (wh - WIN_H * sc) * 0.5f;
 
-    float lx = (float)x * sx;
-    float ly = (float)y * sy;
+    float lx = ((float)x - offX) / sc;
+    float ly = ((float)y - offY) / sc;
     g_lastCursorX = lx;
     g_lastCursorY = ly;
 
@@ -978,23 +983,16 @@ static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
             if (btn == 0) {
                 glfwIconifyWindow(win);
             } else if (btn == 1) {
-                // 自绘最大化：铺满工作区但保持原始宽高比，避免画面被拉伸
-                static int pX = 0, pY = 0, pW = 0, pH = 0;
+                // 最大化交给窗口管理器完成（自行计算铺满尺寸在 WSLg 下会算错屏
+                // 幕尺寸导致窗口跑到屏幕外），画面比例由主循环的等比视口保证
                 static bool maxed = false;
                 if (!maxed) {
-                    glfwGetWindowPos(win, &pX, &pY);
-                    glfwGetWindowSize(win, &pW, &pH);
-                    GLFWmonitor* mon = glfwGetPrimaryMonitor();
-                    int mx = 0, my = 0, mw = 0, mh = 0;
-                    glfwGetMonitorWorkarea(mon, &mx, &my, &mw, &mh);
-                    float s = std::min((float)mw / WIN_W, (float)mh / WIN_H);
-                    int nw = (int)(WIN_W * s), nh = (int)(WIN_H * s);
-                    glfwSetWindowSize(win, nw, nh);
-                    glfwSetWindowPos(win, mx + (mw - nw) / 2, my + (mh - nh) / 2);
+                    glfwSetWindowAspectRatio(win, GLFW_DONT_CARE, GLFW_DONT_CARE);
+                    glfwMaximizeWindow(win);
                     maxed = true;
                 } else {
-                    glfwSetWindowSize(win, pW, pH);
-                    glfwSetWindowPos(win, pX, pY);
+                    glfwRestoreWindow(win);
+                    glfwSetWindowAspectRatio(win, (int)WIN_W, (int)WIN_H);
                     maxed = false;
                 }
             } else {
@@ -1006,8 +1004,8 @@ static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
         int hit = cellAt((float)g_lastCursorX, (float)g_lastCursorY);
         if (hit != 0) g_selected = hit;
 
-        // 只有按在顶部标题条上才允许拖窗，避免每次点击都移动窗口
-        if (g_lastCursorY <= HEADER_H) {
+        // 只有按在顶部标题条上才允许拖窗，避免每次点击都移动窗口；最大化时禁止拖动
+        if (g_lastCursorY <= HEADER_H && !glfwGetWindowAttrib(win, GLFW_MAXIMIZED)) {
             int wwx = 0, wwy = 0;
             glfwGetWindowPos(win, &wwx, &wwy);
             double cx = 0, cy = 0;
