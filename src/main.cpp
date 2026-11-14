@@ -1136,7 +1136,9 @@ int main(int argc, char** argv)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);   // 去掉系统原生标题栏，界面自绘
+    // 先带边框创建（WSLg 软件渲染模式下无边框窗口无法被映射到 Windows），
+    // 映射成功后立刻在运行时去掉边框，界面上仍然没有原生标题栏
+    glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
 
     GLFWwindow* win = glfwCreateWindow((int)WIN_W, (int)WIN_H,
                                        "Periodic - 元素周期表", nullptr, nullptr);
@@ -1146,6 +1148,12 @@ int main(int argc, char** argv)
         return 1;
     }
     glfwMakeContextCurrent(win);
+    // WSLg（软件渲染 COPY MODE）无法映射无边框窗口，故先用带边框创建，
+    // 待窗口被映射后再在运行时去掉边框；同时显式归位到可见区
+    glfwShowWindow(win);
+    glfwPollEvents();
+    glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
+    glfwSetWindowPos(win, 60, 60);
     glfwSwapInterval(1);
     // 只允许等比缩放，禁止拖成非原始比例
     glfwSetWindowAspectRatio(win, (int)WIN_W, (int)WIN_H);
