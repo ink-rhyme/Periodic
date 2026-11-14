@@ -1,4 +1,4 @@
-# 从 WSL 侧调用，调整 WSLg 窗口在 Windows 上的呈现
+﻿# 从 WSL 侧调用，调整 WSLg 窗口在 Windows 上的呈现
 # 用法: powershell -File winframe.ps1 decor|full|restore
 param([string]$Mode = "decor")
 
@@ -55,7 +55,7 @@ public class PWin {
         int style = GetWindowLong(h, GWL_STYLE);
         int mask = unchecked((int)0xFF3CF7FF);   // 清掉 CAPTION/THICKFRAME/SYSMENU/BORDER/DLGFRAME/MIN/MAX
         style &= mask;
-        style = unchecked((int)(style | 0x80000000));  // WS_POPUP
+        style = (int)((uint)style | 0x80000000u);  // WS_POPUP
         SetWindowLong(h, GWL_STYLE, style);
         const uint SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004;
         SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
