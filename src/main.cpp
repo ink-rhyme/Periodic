@@ -77,6 +77,8 @@ void main() {
 static std::vector<float> g_batch;                 // pos2 + rgba4
 static GLuint g_prog = 0, g_vao = 0, g_vbo = 0;
 static GLint  g_locView = -1;
+static float  g_viewW = WIN_W, g_viewH = WIN_H;
+static float  g_LH    = WIN_H;   // 当前布局高度（最大化时窗口更高，多余高度给面板）
 static TextRenderer g_text;
 
 static int    g_selected = 1;   // 默认选中 H
@@ -369,7 +371,7 @@ static void flushBatch()
 {
     if (g_batch.empty()) return;
     glUseProgram(g_prog);
-    glUniform2f(g_locView, WIN_W, WIN_H);
+    glUniform2f(g_locView, g_viewW, g_viewH);
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(g_batch.size() * sizeof(float)),
@@ -564,7 +566,7 @@ static void drawNucleusTooltip(const Element* e)
 
     if (tx < 12.0f) tx = 12.0f;
     if (ty < 14.0f) ty = 14.0f;
-    if (ty + TH > WIN_H - 44.0f) ty = WIN_H - 44.0f - TH;
+    if (ty + TH > g_LH - 44.0f) ty = g_LH - 44.0f - TH;
 
     // 玻璃底：先压一层暗底（模拟磨砂背景虚化），再叠半透明玻璃面
     fillRound(tx, ty, TW, TH, RR, 0.020f, 0.035f, 0.070f, 0.62f * O);
@@ -647,7 +649,7 @@ static void drawDetails(const Element& e)
 {
     float x = PANEL_X, y = HEADER_H;
     float w = PANEL_W;
-    float h = (WIN_H - 14.0f) - y;   // 与左侧主表底板上下对齐
+    float h = (g_LH - 14.0f) - y;   // 与左侧主表底板上下对齐
 
     glowRound(x, y, w, h, 16.0f, GLOW[0], GLOW[1], GLOW[2], 0.55f);
     fillRoundGrad(x, y, w, h, 16.0f,
@@ -718,7 +720,7 @@ static void drawDetails(const Element& e)
     // 电子排布条（K L M N ...）——铺满面板下半部
     {
         float bx0 = x + 26.0f;
-        float baseY = (WIN_H - 14.0f) - 34.0f;   // 柱底基线（贴面板底部）
+        float baseY = (g_LH - 14.0f) - 34.0f;   // 柱底基线（贴面板底部）
         float by0 = baseY - 176.0f;              // 小标题
         std::vector<int> sh;
         int vv = 0;
@@ -823,7 +825,7 @@ static void drawLegend()
     };
 
     float x = TABLE_X + 4.0f;
-    float y = WIN_H - 78.0f;   // 图例收进玻璃底板底部，留足内边距
+    float y = g_LH - 78.0f;   // 图例收进玻璃底板底部，留足内边距
     float cw = CELL_W * 2.0f - 4.0f;
 
     for (int i = 0; i < 10; ++i) {
@@ -845,7 +847,7 @@ static bool g_debugMarkers = false;
 
 static void renderFrame()
 {
-    g_text.beginFrame((int)WIN_W, (int)WIN_H);
+    g_text.beginFrame((int)WIN_W, (int)g_LH);
 
     if (g_iconMode) {
         const float S = 512.0f, cx = S * 0.5f, cy = S * 0.5f, R = S * 0.5f;
@@ -874,10 +876,6 @@ static void renderFrame()
         return;
     }
 
-    drawQuadGrad(0.0f, 0.0f, WIN_W, WIN_H,
-                 BG_TOP[0], BG_TOP[1], BG_TOP[2], 1.0f,
-                 BG_BOT[0], BG_BOT[1], BG_BOT[2], 1.0f);
-    drawStarfield(WIN_W, WIN_H);
 
     // 标题：位于两个面板上方的独立标题栏正中
     float headCx = (TABLE_X - 14.0f + PANEL_X + PANEL_W) * 0.5f;
@@ -890,7 +888,7 @@ static void renderFrame()
     float bx = TABLE_X - 14.0f;
     float by = HEADER_H;
     float bw = TABLE_W + 28.0f;
-    float bh = (WIN_H - 14.0f) - by;   // 顶部留标题栏，底部留 14px
+    float bh = (g_LH - 14.0f) - by;   // 顶部留标题栏，底部留 14px
     glowRound(bx, by, bw, bh, 16.0f, GLOW[0], GLOW[1], GLOW[2], 0.45f);
     fillRoundGrad(bx, by, bw, bh, 16.0f,
                   0.085f, 0.125f, 0.215f, 0.70f,
@@ -927,7 +925,7 @@ static void renderFrame()
     snprintf(hint, sizeof(hint),
              "拖拽移动窗口  ·  ESC 取消选择  ·  Tab 切换原子核悬浮窗触发方式（当前：%s）  ·  Ctrl+Q 退出",
              (g_nucTriggerMode == 0 ? "鼠标悬停" : "长按左键 0.5s"));
-    g_text.draw(hint, TABLE_X + 10.0f, WIN_H - 36.0f, 11,
+    g_text.draw(hint, TABLE_X + 10.0f, g_LH - 36.0f, 11,
                 TEXT_DIM[0], TEXT_DIM[1], TEXT_DIM[2], 0.85f);
 }
 
@@ -949,12 +947,12 @@ static void onCursorPos(GLFWwindow* win, double x, double y)
     int ww = 0, wh = 0;
     glfwGetWindowSize(win, &ww, &wh);
     // 与主循环的等比视口保持一致：按最小缩放铺满并居中，含黑边偏移
-    float sc = 1.0f;
-    if (ww > 0 && wh > 0)
-        sc = std::min((float)ww / WIN_W, (float)wh / WIN_H);
+    float scX = (ww > 0) ? (float)ww / WIN_W : 1.0f;
+    float scY = (wh > 0) ? (float)wh / WIN_H : 1.0f;
+    float sc = scX < scY ? scX : scY;
     if (sc <= 0.0f) sc = 1.0f;
-    float offX = (ww - WIN_W * sc) * 0.5f;
-    float offY = (wh - WIN_H * sc) * 0.5f;
+    float offX = (scY <= scX) ? (ww - WIN_W * sc) * 0.5f : 0.0f;
+    float offY = 0.0f;   // 内容顶部对齐
 
     float lx = ((float)x - offX) / sc;
     float ly = ((float)y - offY) / sc;
@@ -1153,6 +1151,7 @@ int main(int argc, char** argv)
     glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
     glfwSetWindowPos(win, 60, 60);
     glfwSwapInterval(1);
+
     // 只允许等比缩放，禁止拖成非原始比例
     glfwSetWindowAspectRatio(win, (int)WIN_W, (int)WIN_H);
 
@@ -1219,19 +1218,46 @@ int main(int argc, char** argv)
             printed = true;
         }
         glViewport(0, 0, fbW, fbH);
-        // 等比视口：窗口比例被外力改变时也按最小缩放居中显示，避免画面被拉变形
-        float scX = (float)fbW / WIN_W, scY = (float)fbH / WIN_H;
-        float sc = scX < scY ? scX : scY;
-        int vpW = (int)(WIN_W * sc), vpH = (int)(WIN_H * sc);
-        int vpX = (fbW - vpW) / 2, vpY = (fbH - vpH) / 2;
-        glViewport(vpX, vpY, vpW, vpH);
         glClearColor(BG_BOT[0], BG_BOT[1], BG_BOT[2], 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
+
+        // 背景铺满整个窗口
+        g_viewW = (float)fbW; g_viewH = (float)fbH;
+        drawQuadGrad(0.0f, 0.0f, (float)fbW, (float)fbH,
+                     BG_TOP[0], BG_TOP[1], BG_TOP[2], 1.0f,
+                     BG_BOT[0], BG_BOT[1], BG_BOT[2], 1.0f);
+        drawStarfield((float)fbW, (float)fbH);
+        flushBatch();
+
+        // 等比缩放：元素尺寸按最小比例保持一致，多余的高度留给布局
+        // （面板、图例随 g_LH 下移，窗口被拉高时界面铺满而不是留黑边）
+        float scX = (float)fbW / WIN_W, scY = (float)fbH / WIN_H;
+        float sc = scX < scY ? scX : scY;
+        int vpW = (int)(WIN_W * sc), vpH = fbH;
+        int vpX = 0;
+        if (scY <= scX) {                 // 高度先到边：铺满高度，左右居中
+            vpW = (int)(WIN_W * sc);
+            vpX = (fbW - vpW) / 2;
+            g_LH = WIN_H;
+        } else {                          // 宽度先到边：铺满宽度，多余高度给布局
+            vpW = fbW;
+            vpX = 0;
+            g_LH = (float)fbH / sc;
+        }
+        glViewport(vpX, 0, vpW, vpH);
+        g_viewW = (float)vpW / sc; g_viewH = g_LH;
 
         renderFrame();
         flushBatch();
         g_text.flush();
 
+        // 首帧时窗口可能刚被改过尺寸，先多渲染几帧再截图，避免读到旧帧缓冲
+        static int shotWarmup = 0;
+        if (!shotPath.empty() && shotWarmup < 2) {
+            ++shotWarmup;
+            glfwSwapBuffers(win);
+            continue;
+        }
         if (!shotPath.empty()) {
             if (demoTooltip && frames == 0) {
                 frames = 1;
