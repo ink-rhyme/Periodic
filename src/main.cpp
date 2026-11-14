@@ -3,6 +3,10 @@
 // 数据由 assets/elements_cn.csv (+ elements_en.csv) 运行时加载
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_X11
+#include <GLFW/glfw3native.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
 
 #include "ElementData.h"
 #include "TextRenderer.h"
@@ -1191,6 +1195,13 @@ int main(int argc, char** argv)
     glfwShowWindow(win);
     glfwPollEvents();
     glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
+    {   // 让窗口脱离窗口管理器管理，WSLg/Weston 就不会画标题栏和投影
+        Display* xdpy = glfwGetX11Display();
+        Window xw = glfwGetX11Window(win);
+        XSetWindowAttributes xa;
+        xa.override_redirect = True;
+        XChangeWindowAttributes(xdpy, xw, CWOverrideRedirect, &xa);
+    }
     glfwSetWindowPos(win, 60, 60);
     winInterop("decor");
     glfwSwapInterval(1);

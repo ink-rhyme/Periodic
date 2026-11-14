@@ -95,6 +95,17 @@ public class PWin {
         SetWindowPos(h, new IntPtr(-1), x, y, w, hh, SWP_SHOW | SWP_NOACTIVATE);   // HWND_TOPMOST
     }
 
+    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] public static extern int GetDeviceCaps(IntPtr dc, int idx);
+
+    public static int Dpi() {
+        IntPtr dc = GetDC(IntPtr.Zero);
+        int d = GetDeviceCaps(dc, 88);   // LOGPIXELSX
+        ReleaseDC(IntPtr.Zero, dc);
+        return d > 0 ? d : 96;
+    }
+
     public static string RectText(IntPtr h) {
         int[] r = Rect(h);
         return "" + r[0] + "," + r[1] + " " + r[2] + "x" + r[3];
@@ -148,7 +159,16 @@ switch ($Mode) {
         $sr = [PWin]::ScreenRect()
         Set-Content -LiteralPath $lockFile -Value ("{0} {1} {2} {3}" -f $sr[0], $sr[1], $sr[2], $sr[3]) -Encoding ascii
         [PWin]::StripFrame($h)
-        [PWin]::Pin($h, $sr[0], $sr[1], $sr[2], $sr[3])
+        # WSLg 的 RDP 画面在宿主窗口里左/上各内缩一段（实测 40 / 60 像素 @150%），
+        # 把宿主窗口往左上顶出去同样多，画面才真正从 0,0 开始铺到屏幕边缘
+        $dpi = [PWin]::Dpi()
+        $sc = $dpi / 96.0
+        $dx = [int][Math]::Round(26.7 * $sc)
+        $dy = [int][Math]::Round(40.0 * $sc)
+        $tx = $sr[0] - $dx; $ty = $sr[1] - $dy
+        $tw = $sr[2] + $dx; $th = $sr[3] + $dy
+        Set-Content -LiteralPath $lockFile -Value ("{0} {1} {2} {3}" -f $tx, $ty, $tw, $th) -Encoding ascii
+        [PWin]::Pin($h, $tx, $ty, $tw, $th)
         Watch-Loop 900
         "rect=" + [PWin]::RectText($h) + " target=" + ($sr -join " ")
     }
