@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
+#include <unistd.h>
 #include <cstdio>
 #include <chrono>
 #include <thread>
@@ -968,6 +970,30 @@ static void onCursorPos(GLFWwindow* win, double x, double y)
 }
 
 
+
+// 通过 WSL interop 调用 Windows 端脚本，把 WSLg 窗口钉成整屏 / 还原 / 去圆角阴影
+static void winInterop(const char* mode)
+{
+    const char* distro = getenv("WSL_DISTRO_NAME");
+    if (!distro || !*distro) return;          // 非 WSL 环境直接跳过
+    char exe[PATH_MAX] = {0};
+    if (!realpath("/proc/self/exe", exe)) return;
+    std::string root = exe;
+    size_t pos = root.rfind("/bin/");
+    if (pos == std::string::npos) return;     // 只认 <root>/bin/Periodic 这种布局
+    root = root.substr(0, pos);
+    std::string script = root + "/tools/winframe.ps1";
+    std::string winPath = "\\\\wsl$\\" + std::string(distro);
+    for (size_t i = 0; i < script.size(); ++i)
+        winPath += (script[i] == '/' ? '\\' : script[i]);
+    std::string cmd =
+        "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        " -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File '"
+        + winPath + "' " + mode + " >/dev/null 2>&1 &";
+    int rc = system(cmd.c_str());
+    (void)rc;
+}
+
 static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
 {
     (void)mods;
@@ -983,14 +1009,20 @@ static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
             if (btn == 0) {
                 glfwIconifyWindow(win);
             } else if (btn == 1) {
-                // 最大化交给窗口管理器：位置和尺寸由 WM 决定，WSLg 下最可靠
+                // 先让 GLFW 把画布切成整屏模式（拿到 16:9 的渲染尺寸），
+                // 再让 Windows 端把窗口钉到主屏整屏矩形：连任务栏一起盖住
                 static bool maxed = false;
                 if (!maxed) {
+                    // 画布先切成 16:9 并铺满，再让 Windows 端把窗口钉到主屏整屏矩形
+                    // （含任务栏）；比例一致，钉屏后只是等比放大，不会变形
                     glfwSetWindowAspectRatio(win, GLFW_DONT_CARE, GLFW_DONT_CARE);
-                    glfwMaximizeWindow(win);
+                    glfwSetWindowSize(win, 1920, 1080);
+                    glfwPollEvents();
+                    winInterop("full");
                     maxed = true;
                 } else {
-                    glfwRestoreWindow(win);
+                    winInterop("restore");
+                    glfwSetWindowSize(win, (int)WIN_W, (int)WIN_H);
                     glfwSetWindowAspectRatio(win, (int)WIN_W, (int)WIN_H);
                     maxed = false;
                 }
@@ -1151,6 +1183,7 @@ int main(int argc, char** argv)
     glfwPollEvents();
     glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
     glfwSetWindowPos(win, 60, 60);
+    winInterop("decor");
     glfwSwapInterval(1);
 
 
