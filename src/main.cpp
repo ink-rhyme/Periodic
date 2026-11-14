@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -647,15 +649,15 @@ static void drawNucleusTooltip(const Element* e)
 // ---------------- 右侧详情面板 ----------------
 static void drawDetails(const Element& e)
 {
+    // 面板铺到窗口右/下边缘并不再画外发光：窗口四周不留虚边/模糊光晕
     float x = PANEL_X, y = HEADER_H;
-    float w = PANEL_W;
-    float h = (g_LH - 14.0f) - y;   // 与左侧主表底板上下对齐
+    float w = WIN_W - PANEL_X;
+    float h = g_LH - y;
 
-    glowRound(x, y, w, h, 16.0f, GLOW[0], GLOW[1], GLOW[2], 0.55f);
-    fillRoundGrad(x, y, w, h, 16.0f,
+    fillRoundGrad(x, y, w, h, 2.0f,
                   PANEL_TOP[0], PANEL_TOP[1], PANEL_TOP[2], PANEL_TOP[3],
                   PANEL_BOT[0], PANEL_BOT[1], PANEL_BOT[2], PANEL_BOT[3]);
-    strokeRound(x, y, w, h, 16.0f, 1.4f, BORDER[0], BORDER[1], BORDER[2], BORDER[3], 8);
+    strokeRound(x, y, w, h, 2.0f, 1.4f, BORDER[0], BORDER[1], BORDER[2], BORDER[3], 8);
 
     float c[3] = {0.5f, 0.5f, 0.5f};
     categoryColor(e.category, c);
@@ -885,15 +887,14 @@ static void renderFrame()
                         TEXT_DIM[0], TEXT_DIM[1], TEXT_DIM[2], 0.85f);
 
     // 主表玻璃底板
-    float bx = TABLE_X - 14.0f;
+    float bx = 0.0f;
     float by = HEADER_H;
-    float bw = TABLE_W + 28.0f;
-    float bh = (g_LH - 14.0f) - by;   // 顶部留标题栏，底部留 14px
-    glowRound(bx, by, bw, bh, 16.0f, GLOW[0], GLOW[1], GLOW[2], 0.45f);
-    fillRoundGrad(bx, by, bw, bh, 16.0f,
+    float bw = PANEL_X - 16.0f;
+    float bh = g_LH - by;
+    fillRoundGrad(bx, by, bw, bh, 2.0f,
                   0.085f, 0.125f, 0.215f, 0.70f,
                   0.030f, 0.052f, 0.100f, 0.58f);
-    strokeRound(bx, by, bw, bh, 16.0f, 1.2f, BORDER[0], BORDER[1], BORDER[2], 0.35f, 8);
+    strokeRound(bx, by, bw, bh, 2.0f, 1.2f, BORDER[0], BORDER[1], BORDER[2], 0.35f, 8);
 
     // 周期编号
     for (int r = 0; r < 7; ++r) {
@@ -966,6 +967,7 @@ static void onCursorPos(GLFWwindow* win, double x, double y)
     g_btnHot = winBtnHit(lx, ly);
 }
 
+
 static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
 {
     (void)mods;
@@ -981,8 +983,7 @@ static void onMouseButton(GLFWwindow* win, int button, int action, int mods)
             if (btn == 0) {
                 glfwIconifyWindow(win);
             } else if (btn == 1) {
-                // 最大化交给窗口管理器完成（自行计算铺满尺寸在 WSLg 下会算错屏
-                // 幕尺寸导致窗口跑到屏幕外），画面比例由主循环的等比视口保证
+                // 最大化交给窗口管理器：位置和尺寸由 WM 决定，WSLg 下最可靠
                 static bool maxed = false;
                 if (!maxed) {
                     glfwSetWindowAspectRatio(win, GLFW_DONT_CARE, GLFW_DONT_CARE);
@@ -1151,6 +1152,11 @@ int main(int argc, char** argv)
     glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
     glfwSetWindowPos(win, 60, 60);
     glfwSwapInterval(1);
+
+
+
+
+
 
     // 只允许等比缩放，禁止拖成非原始比例
     glfwSetWindowAspectRatio(win, (int)WIN_W, (int)WIN_H);
